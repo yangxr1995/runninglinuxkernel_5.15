@@ -272,6 +272,7 @@ static inline bool before(__u32 seq1, __u32 seq2)
 {
         return (__s32)(seq1-seq2) < 0;
 }
+// seq2 > seq1
 #define after(seq2, seq1) 	before(seq1, seq2)
 
 /* is s2<=s1<=s3 ? */
@@ -1045,12 +1046,11 @@ struct rate_sample {
 struct tcp_congestion_ops {
 /* fast path fields are put first to fill one cache line */
 
+    // 核心回调
 	/* return slow start threshold (required) */
-	u32 (*ssthresh)(struct sock *sk);
-
+	u32 (*ssthresh)(struct sock *sk); // 计算慢启动阈值
 	/* do new cwnd calculation (required) */
-	void (*cong_avoid)(struct sock *sk, u32 ack, u32 acked);
-
+	void (*cong_avoid)(struct sock *sk, u32 ack, u32 acked); // 拥塞避免
 	/* call before changing ca_state (optional) */
 	void (*set_state)(struct sock *sk, u8 new_state);
 
@@ -1073,7 +1073,7 @@ struct tcp_congestion_ops {
 
 
 	/* new value of cwnd after loss (required) */
-	u32  (*undo_cwnd)(struct sock *sk);
+	u32  (*undo_cwnd)(struct sock *sk); // 回退拥塞窗口
 	/* returns the multiplier used in tcp_sndbuf_expand (optional) */
 	u32 (*sndbuf_expand)(struct sock *sk);
 
@@ -1082,12 +1082,13 @@ struct tcp_congestion_ops {
 	size_t (*get_info)(struct sock *sk, u32 ext, int *attr,
 			   union tcp_cc_info *info);
 
-	char 			name[TCP_CA_NAME_MAX];
+	char 			name[TCP_CA_NAME_MAX]; // 算法名称
 	struct module		*owner;
 	struct list_head	list;
-	u32			key;
-	u32			flags;
+	u32			key; // 哈希键值
+	u32			flags; // 标志位
 
+    // 可选函数
 	/* initialize private data (optional) */
 	void (*init)(struct sock *sk);
 	/* cleanup private data  (optional) */
@@ -1888,12 +1889,13 @@ static inline void tcp_push_pending_frames(struct sock *sk)
  */
 static inline u32 tcp_highest_sack_seq(struct tcp_sock *tp)
 {
-	if (!tp->sacked_out)
-		return tp->snd_una;
+	if (!tp->sacked_out) // 1) 没有 SACKed segment
+		return tp->snd_una; // 最高确认位置即未确认的起点
 
-	if (tp->highest_sack == NULL)
-		return tp->snd_nxt;
+	if (tp->highest_sack == NULL) // 2) SACK count>0 但最高 SACK 块指针为空（特殊情况）
+		return tp->snd_nxt; // 退回到下一个待发送的序列号
 
+    // 3) 正常情况：返回最高 SACK 块的起始序列号
 	return TCP_SKB_CB(tp->highest_sack)->seq;
 }
 

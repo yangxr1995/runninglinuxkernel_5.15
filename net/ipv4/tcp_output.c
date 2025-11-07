@@ -163,6 +163,8 @@ static void tcp_event_data_sent(struct tcp_sock *tp,
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	const u32 now = tcp_jiffies32;
 
+    // 当没有飞行中的包（空窗口状态）时，发送数据包会触发 `CA_EVENT_TX_START`
+    // 用于区分传输重启和真实拥塞
 	if (tcp_packets_in_flight(tp) == 0)
 		tcp_ca_event(sk, CA_EVENT_TX_START);
 
@@ -1196,6 +1198,9 @@ enum hrtimer_restart tcp_pace_kick(struct hrtimer *timer)
 	return HRTIMER_NORESTART;
 }
 
+// 该函数在 TCP 数据包成功发送后被调用，主要完成两个任务：
+// 1. 更新 TCP 流量控制（pacing）相关的时间戳
+// 2. 将发送完成的 skb 移动到已排序的发送队列中
 static void tcp_update_skb_after_send(struct sock *sk, struct sk_buff *skb,
 				      u64 prior_wstamp)
 {
@@ -1208,15 +1213,24 @@ static void tcp_update_skb_after_send(struct sock *sk, struct sk_buff *skb,
 		 * Note that tp->data_segs_out overflows after 2^32 packets,
 		 * this is a minor annoyance.
 		 */
+        // 确保速率不是无限大（`~0UL` 表示未限制）
+        // 确保已经发送了至少 10 个数据段（避免前几个数据段的 pacing）
+        // 前 10 个 MSS 优化：原始的 `sch_fq` 调度器不对前 10 个 MSS 进行 pacing，避免过度限制初始传输
 		if (rate != ~0UL && rate && tp->data_segs_out >= 10) {
+            // 计算发送当前数据包需要的时间
 			u64 len_ns = div64_ul((u64)skb->len * NSEC_PER_SEC, rate);
+            // 计算可用的时间信用（当前时间与之前时间的差值）
 			u64 credit = tp->tcp_wstamp_ns - prior_wstamp;
 
 			/* take into account OS jitter */
+            // 考虑操作系统调度的不确定性（jitter），减少计算出的时间
 			len_ns -= min_t(u64, len_ns / 2, credit);
+            // 更新下次发送数据包的时间戳
 			tp->tcp_wstamp_ns += len_ns;
 		}
 	}
+    // 将发送完成的 skb 从发送队列移动到已排序的已发送队列
+    // tsorted_sent_queue: 用于追踪按时间排序的已发送但未被确认的数据包
 	list_move_tail(&skb->tcp_tsorted_anchor, &tp->tsorted_sent_queue);
 }
 
@@ -1235,6 +1249,7 @@ INDIRECT_CALLABLE_DECLARE(void tcp_v4_send_check(struct sock *sk, struct sk_buff
  * We are working here with either a clone of the original
  * SKB, or a fresh unique copy made by the retransmit engine.
  */
+// 负责实际构建和发送TCP数据包。
 static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 			      int clone_it, gfp_t gfp_mask, u32 rcv_nxt)
 {
@@ -1251,6 +1266,7 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 	int err;
 
 	BUG_ON(!skb || !tcp_skb_pcount(skb));
+    // 更新TCP时间戳，用于流量控制（pacing）
 	tp = tcp_sk(sk);
 	prior_wstamp = tp->tcp_wstamp_ns;
 	tp->tcp_wstamp_ns = max(tp->tcp_wstamp_ns, tp->tcp_clock_cache);
@@ -1375,9 +1391,11 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 			   tcp_v6_send_check, tcp_v4_send_check,
 			   sk, skb);
 
+    // 发送ACK后的统计和计时器处理
 	if (likely(tcb->tcp_flags & TCPHDR_ACK))
 		tcp_event_ack_sent(sk, tcp_skb_pcount(skb), rcv_nxt);
 
+    // 更新发送字节数、数据段数等统计信息
 	if (skb->len != tcp_header_size) {
 		tcp_event_data_sent(tp, sk);
 		tp->data_segs_out += tcp_skb_pcount(skb);
@@ -1402,6 +1420,7 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 
 	tcp_add_tx_delay(skb, tp);
 
+    // 传给IP层
 	err = INDIRECT_CALL_INET(icsk->icsk_af_ops->queue_xmit,
 				 inet6_csk_xmit, ip_queue_xmit,
 				 sk, skb, &inet->cork.fl);
@@ -1411,6 +1430,7 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
 		err = net_xmit_eval(err);
 	}
 	if (!err && oskb) {
+        // 更新发送完成后的时间戳和速率统计
 		tcp_update_skb_after_send(sk, oskb, prior_wstamp);
 		tcp_rate_skb_sent(sk, oskb);
 	}
@@ -2028,25 +2048,42 @@ static unsigned int tcp_mss_split_point(const struct sock *sk,
 /* Can at least one segment of SKB be sent right now, according to the
  * congestion window rules?  If so, return how many segments are allowed.
  */
+// `tcp_cwnd_test()` 根据当前拥塞窗口 (`snd_cwnd`) 和已在网络中的段数 
+// (`in_flight`)，在保证至少保留 half‑cwnd 余量的前提下，
+// 计算出还能再发送多少个 TCP 段。
+//
+// 返回值表示“本次最多可以再发送多少个 TCP 段”。
+// 如果返回值 >= `tcp_skb_pcount(skb)`，说明该 `skb` 可以一次性全部发送；
+// 否则会被拆分（`tso_fragment()`）或延迟发送。
 static inline unsigned int tcp_cwnd_test(const struct tcp_sock *tp,
 					 const struct sk_buff *skb)
 {
 	u32 in_flight, cwnd, halfcwnd;
 
 	/* Don't be strict about the congestion window for the final FIN.  */
+	/* 1. 对 FIN 段放宽限制，即使拥塞窗口已满也要发送。 */
 	if ((TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN) &&
 	    tcp_skb_pcount(skb) == 1)
 		return 1;
 
+	/* 2. 读取当前在飞行中的数据包数量和拥塞窗口大小。 */
 	in_flight = tcp_packets_in_flight(tp);
 	cwnd = tp->snd_cwnd;
+	/* 3. 如果已经占满拥塞窗口，则不能再发送任何段。 */
 	if (in_flight >= cwnd)
 		return 0;
 
 	/* For better scheduling, ensure we have at least
 	 * 2 GSO packets in flight.
 	 */
+	/* 4. 为了更好的调度，要求至少还有 1/2 窗口的余量（但不少于 1）。 */
 	halfcwnd = max(cwnd >> 1, 1U);
+
+	/* 5. 本次可以发送的段数受两个限制：
+	 *    - 拥塞窗口剩余空间 (cwnd - in_flight)
+	 *    - halfcwnd（防止一次发送太多导致突发）
+	 *    取较小值即为实际可以发送的段数。
+	 */
 	return min(halfcwnd, cwnd - in_flight);
 }
 
@@ -2092,6 +2129,7 @@ static inline bool tcp_nagle_test(const struct tcp_sock *tp, const struct sk_buf
 }
 
 /* Does at least the first segment of SKB fit into the send window? */
+// 检查数据包是否可以安全发送而不会超出接收方的窗口限制。
 static bool tcp_snd_wnd_test(const struct tcp_sock *tp,
 			     const struct sk_buff *skb,
 			     unsigned int cur_mss)
@@ -2464,13 +2502,20 @@ static int tcp_mtu_probe(struct sock *sk)
 	return -1;
 }
 
+// 用于确定是否需要延迟TCP数据包的发送，以实现精确的流量控制和避免网络拥塞。
 static bool tcp_pacing_check(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
+    // 如果有内部pacing(比如BBR)，则使用内部pacing
 	if (!tcp_needs_internal_pacing(sk))
 		return false;
 
+    // 使用默认的 pacing
+
+   // `tp->tcp_wstamp_ns`：下次允许发送数据的时间戳（纳秒）
+   // `tp->tcp_clock_cache`：当前缓存的时钟时间
+   // 如果下次发送时间未到，返回`false`（继续等待）
 	if (tp->tcp_wstamp_ns <= tp->tcp_clock_cache)
 		return false;
 
@@ -2596,6 +2641,8 @@ void tcp_chrono_stop(struct sock *sk, const enum tcp_chrono type)
  * Returns true, if no segments are in flight and we have queued segments,
  * but cannot send anything now because of SWS or another problem.
  */
+// 函数根据当前网络状态（如拥塞窗口、接收窗口、MTU等）智能选择并发送合适的数据包
+// 负责将发送队列中的数据包写入网络
 static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 			   int push_one, gfp_t gfp)
 {
@@ -2620,7 +2667,8 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		}
 	}
 
-	max_segs = tcp_tso_segs(sk, mss_now);
+	max_segs = tcp_tso_segs(sk, mss_now); // 获得最大 TSO 分段数量
+    // 用于将发送队列中的数据包发送到网络, 直到遇到发送限制
 	while ((skb = tcp_send_head(sk))) {
 		unsigned int limit;
 
@@ -2632,38 +2680,43 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 			goto repair; /* Skip network transmission */
 		}
 
-		if (tcp_pacing_check(sk))
+		if (tcp_pacing_check(sk)) // 流量控制
 			break;
 
 		tso_segs = tcp_init_tso_segs(skb, mss_now);
 		BUG_ON(!tso_segs);
 
+        // 检查拥塞窗口剩余空间，确保不会超过网络容量
 		cwnd_quota = tcp_cwnd_test(tp, skb);
 		if (!cwnd_quota) {
 			if (push_one == 2)
 				/* Force out a loss probe pkt. */
-				cwnd_quota = 1;
+				cwnd_quota = 1; // 强制发送丢包的探测包
 			else
-				break;
+				break; // 拥塞窗口满了，停止发送
 		}
 
+        // 确保数据包不会超出接收方的接收窗口
 		if (unlikely(!tcp_snd_wnd_test(tp, skb, mss_now))) {
 			is_rwnd_limited = true;
 			break;
 		}
 
 		if (tso_segs == 1) {
+            // 单段数据：检查 Nagle 算法
 			if (unlikely(!tcp_nagle_test(tp, skb, mss_now,
 						     (tcp_skb_is_last(sk, skb) ?
 						      nonagle : TCP_NAGLE_PUSH))))
 				break;
 		} else {
+            // 多段 TSO 数据：检查是否应该延迟发送
 			if (!push_one &&
 			    tcp_tso_should_defer(sk, skb, &is_cwnd_limited,
 						 &is_rwnd_limited, max_segs))
 				break;
 		}
 
+        // 如果数据包过长，进行分段处理以适应 MSS 限制
 		limit = mss_now;
 		if (tso_segs > 1 && !tcp_urg_mode(tp))
 			limit = tcp_mss_split_point(sk, skb, mss_now,
@@ -2676,6 +2729,7 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		    unlikely(tso_fragment(sk, skb, limit, mss_now, gfp)))
 			break;
 
+        // 检查发送队列是否过大，避免队列膨胀
 		if (tcp_small_queue_check(sk, skb, 0))
 			break;
 
@@ -2684,9 +2738,11 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 		 * We do not want to send a pure-ack packet and have
 		 * a strange looking rtx queue with empty packet(s).
 		 */
+        // 跳过空数据包（只有头部没有数据）
 		if (TCP_SKB_CB(skb)->end_seq == TCP_SKB_CB(skb)->seq)
 			break;
 
+        // 调用底层传输函数发送数据包
 		if (unlikely(tcp_transmit_skb(sk, skb, 1, gfp)))
 			break;
 

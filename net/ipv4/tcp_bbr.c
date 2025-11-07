@@ -70,6 +70,7 @@
  * an issue. The upper bound isn't an issue with existing technologies.
  */
 #define BW_SCALE 24
+// 带宽的缩放因子，
 #define BW_UNIT (1 << BW_SCALE)
 
 #define BBR_SCALE 8	/* scaling factor for fractions in BBR (e.g. gains) */
@@ -99,10 +100,10 @@ struct bbr {
 		idle_restart:1,	     /* restarting after idle? */
 		probe_rtt_round_done:1,  /* a BBR_PROBE_RTT round at 4 pkts? */
 		unused:13,
-		lt_is_sampling:1,    /* taking long-term ("LT") samples now? */
+		lt_is_sampling:1,  // 标志位标识当前是否正在进行长期采样   /* taking long-term ("LT") samples now? */
 		lt_rtt_cnt:7,	     /* round trips in long-term interval */
-		lt_use_bw:1;	     /* use lt_bw as our bw estimate? */
-	u32	lt_bw;		     /* LT est delivery rate in pkts/uS << 24 */
+		lt_use_bw:1;// 是否使用长期采样值，1: 优先使用 lt_bw , 0:使用bbr_max_bw	     /* use lt_bw as our bw estimate? */
+	u32	lt_bw;	// 最近的长期采样得到的带宽估算值	     /* LT est delivery rate in pkts/uS << 24 */
 	u32	lt_last_delivered;   /* LT intvl start: tp->delivered */
 	u32	lt_last_stamp;	     /* LT intvl start: tp->delivered_mstamp */
 	u32	lt_last_lost;	     /* LT intvl start: tp->lost */
@@ -142,6 +143,7 @@ static const int bbr_min_tso_rate = 1200000;
  * lower than the estimated bandwidth. This is an important aspect of the
  * design.
  */
+// 平均速率保持在略低于估计带宽的约1%，以减少瓶颈处的队列
 static const int bbr_pacing_margin_percent = 1;
 
 /* We use a high_gain value of 2/ln(2) because it's the smallest pacing gain
@@ -149,19 +151,35 @@ static const int bbr_pacing_margin_percent = 1;
  * and send the same number of packets per RTT that an un-paced, slow-starting
  * Reno or CUBIC flow would:
  */
+// 高增益值
+// 约为 2.885倍带宽
+// 在BBR启动阶段使用，允许平滑增长的发送速率
+// 确保每个RTT内发送速率翻倍，同时保持与未调度的慢启动Reno或CUBIC流相同的每个RTT数据包数量
 static const int bbr_high_gain  = BBR_UNIT * 2885 / 1000 + 1;
 /* The pacing gain of 1/high_gain in BBR_DRAIN is calculated to typically drain
  * the queue created in BBR_STARTUP in a single round:
  */
+// 排空增益值
+// 约为 0.347 倍带宽
+// 在BBR排空阶段使用
+// 通常在单个RTT内排空BBR_STARTUP阶段创建的队列
 static const int bbr_drain_gain = BBR_UNIT * 1000 / 2885;
 /* The gain for deriving steady-state cwnd tolerates delayed/stretched ACKs: */
+// 拥塞窗口增益值
+// 2倍的带宽
+// 用于计算稳态下的拥塞窗口大小
+// 容忍延迟/拉伸的ACK，确保有足够的缓冲区应对网络抖动
 static const int bbr_cwnd_gain  = BBR_UNIT * 2;
 /* The pacing_gain values for the PROBE_BW gain cycle, to discover/share bw: */
+// 调速增益数组
+// 在BBR探测带宽阶段使用的调速增益循环
+// 序列: [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+// 目的: 发现和共享网络带宽，通过不同增益值探测网络容量
 static const int bbr_pacing_gain[] = {
-	BBR_UNIT * 5 / 4,	/* probe for more available bw */
-	BBR_UNIT * 3 / 4,	/* drain queue and/or yield bw to other flows */
-	BBR_UNIT, BBR_UNIT, BBR_UNIT,	/* cruise at 1.0*bw to utilize pipe, */
-	BBR_UNIT, BBR_UNIT, BBR_UNIT	/* without creating excess queue... */
+	BBR_UNIT * 5 / 4,/* 探测更多可用带宽 */	/* probe for more available bw */
+	BBR_UNIT * 3 / 4,/* 排空队列和/或让出带宽给其他流 */	/* drain queue and/or yield bw to other flows */
+	BBR_UNIT, BBR_UNIT, BBR_UNIT,  /* 以1.0*bw巡航 */	/* cruise at 1.0*bw to utilize pipe, */
+	BBR_UNIT, BBR_UNIT, BBR_UNIT  /* 利用管道而不产生超额队列 */	/* without creating excess queue... */
 };
 /* Randomize the starting gain cycling phase over N phases: */
 static const u32 bbr_cycle_rand = 7;
@@ -243,21 +261,27 @@ static u64 bbr_rate_bytes_per_sec(struct sock *sk, u64 rate, int gain)
 {
 	unsigned int mss = tcp_sk(sk)->mss_cache;
 
-	rate *= mss;
-	rate *= gain;
-	rate >>= BBR_SCALE;
+	rate *= mss; // 数据包/微秒 → 字节/微秒
+	rate *= gain; // 应用增益因子
+	rate >>= BBR_SCALE; // 撤销 BBR_SCALE 的缩放
+                        // gain中使用 BBR_SCALE 缩放，这里需要撤销，以得到真实增益
+    // 字节/微妙 -> 字节/秒
+    // 并降低 1%，避免队列积累
+    // 计算示例：`1000000/100 * 99 = 990000`
 	rate *= USEC_PER_SEC / 100 * (100 - bbr_pacing_margin_percent);
-	return rate >> BW_SCALE;
+	return rate >> BW_SCALE; // 撤销 BW_SCALE 缩放
 }
 
 /* Convert a BBR bw and gain factor to a pacing rate in bytes per second. */
+// 根据BBR带宽和增益参数，计算发送速率，单位s
 static unsigned long bbr_bw_to_pacing_rate(struct sock *sk, u32 bw, int gain)
 {
 	u64 rate = bw;
 
 	rate = bbr_rate_bytes_per_sec(sk, rate, gain);
+    // sk_max_pacing_rate : 默认为无限大，可以通过 setsockopt 配置
 	rate = min_t(u64, rate, sk->sk_max_pacing_rate);
-	return rate;
+	return rate; // 返回 估算发送速率 字节/s
 }
 
 /* Initialize pacing rate to: high_gain * init_cwnd / RTT. */
@@ -274,8 +298,12 @@ static void bbr_init_pacing_rate_from_rtt(struct sock *sk)
 	} else {			 /* no RTT sample yet */
 		rtt_us = USEC_PER_MSEC;	 /* use nominal default RTT */
 	}
+    // tp->snd_cwnd ，单位报文数量
+    // 正式带宽计算: snd_cwnd * MSS / rtt
+    // 乘以 BW_UNIT: 将整数放大 1<<24 倍，减少下一步整数除法导致的精度损失。
 	bw = (u64)tp->snd_cwnd * BW_UNIT;
 	do_div(bw, rtt_us);
+    // bbr_bw_to_pacing_rate 内部会将 rate >> BW_SCALE ，以去掉缩放因子的影响
 	sk->sk_pacing_rate = bbr_bw_to_pacing_rate(sk, bw, bbr_high_gain);
 }
 
@@ -293,6 +321,14 @@ static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
 }
 
 /* override sysctl_tcp_min_tso_segs */
+// 根据网络带宽情况，决定 TSO 分块数量
+// 高带宽，分2个TSO
+// 低带宽，分1个TSO
+//
+// 高速/低速 指应用的特征是否为大流量
+//
+// 低速网络: 带宽不是瓶颈，所以TSO为1，减少cpu使用
+// 高速网络: 带宽是瓶颈，所以TSO为2，让发送间隔更均匀，带宽更平滑，更好利用网络，但增加cpu负担
 static u32 bbr_min_tso_segs(struct sock *sk)
 {
 	return sk->sk_pacing_rate < (bbr_min_tso_rate >> 3) ? 1 : 2;
@@ -331,16 +367,22 @@ static void bbr_cwnd_event(struct sock *sk, enum tcp_ca_event event)
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
 
+    // 若是新的发送周期(本skb发送时，在途字节为0)
+    // 且当前链路应用受限(这是由上个发送周期导致的)
 	if (event == CA_EVENT_TX_START && tp->app_limited) {
 		bbr->idle_restart = 1;
-		bbr->ack_epoch_mstamp = tp->tcp_mstamp;
-		bbr->ack_epoch_acked = 0;
+		bbr->ack_epoch_mstamp = tp->tcp_mstamp; // ACK 计时周期的起始时间戳
+		bbr->ack_epoch_acked = 0; //  bbr_update_ack_aggregation`）时的间隔计时周期内已经累计确认的报文段数，重置为 0，重新开始计数
 		/* Avoid pointless buffer overflows: pace at est. bw if we don't
 		 * need more speed (we're restarting from idle and app-limited).
 		 */
+        // 把带宽增益参数设为1.0，
+        // 防止在刚恢复且仍受限于应用层时，发送速率继续增长而导致缓冲区溢出
 		if (bbr->mode == BBR_PROBE_BW)
 			bbr_set_pacing_rate(sk, bbr_bw(sk), BBR_UNIT);
 		else if (bbr->mode == BBR_PROBE_RTT)
+        // 检查是否已经满足 退出 PROBE_RTT 的条件
+        // 由于此时仍然是 app‑limited，BBR 会提前尝试结束探测，重新进入先前的模式（通常是 `PROBE_BW`），以免在低流量期间继续限制发送速率
 			bbr_check_probe_rtt_done(sk);
 	}
 }
@@ -634,21 +676,22 @@ static void bbr_reset_lt_bw_sampling_interval(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
 
-	bbr->lt_last_stamp = div_u64(tp->delivered_mstamp, USEC_PER_MSEC);
-	bbr->lt_last_delivered = tp->delivered;
-	bbr->lt_last_lost = tp->lost;
-	bbr->lt_rtt_cnt = 0;
+	bbr->lt_last_stamp = div_u64(tp->delivered_mstamp, USEC_PER_MSEC); // 记录采样起点的时间戳
+	bbr->lt_last_delivered = tp->delivered; // 记录采样的起始计数器
+	bbr->lt_last_lost = tp->lost;  // 记录采样的起始计数器
+	bbr->lt_rtt_cnt = 0; // 重置采样区间的 RTT 计数器
 }
 
 /* Completely reset long-term bandwidth sampling. */
+// 重新开始长期带宽采样
 static void bbr_reset_lt_bw_sampling(struct sock *sk)
 {
 	struct bbr *bbr = inet_csk_ca(sk);
 
-	bbr->lt_bw = 0;
-	bbr->lt_use_bw = 0;
-	bbr->lt_is_sampling = false;
-	bbr_reset_lt_bw_sampling_interval(sk);
+	bbr->lt_bw = 0; // 清除长期带宽估计值
+	bbr->lt_use_bw = 0; // 关闭使用长期带宽标志
+	bbr->lt_is_sampling = false; // 禁止长期采样
+	bbr_reset_lt_bw_sampling_interval(sk); // 初始化一个新的长期带宽采样区间
 }
 
 /* Long-term bw sampling interval is done. Estimate whether we're policed. */
@@ -749,7 +792,7 @@ static void bbr_lt_bw_sampling(struct sock *sk, const struct rate_sample *rs)
 		return;
 	}
 	t *= USEC_PER_MSEC;
-	bw = (u64)delivered * BW_UNIT;
+	bw = (u64)delivered * BW_UNIT; // 将当前拥塞窗口(cwnd)乘以 BW_UNIT 来避免在后续除法中丢失精度。
 	do_div(bw, t);
 	bbr_lt_bw_interval_done(sk, bw);
 }
@@ -1039,39 +1082,42 @@ static void bbr_init(struct sock *sk)
 	struct bbr *bbr = inet_csk_ca(sk);
 
 	bbr->prior_cwnd = 0;
-	tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
+	tp->snd_ssthresh = TCP_INFINITE_SSTHRESH; // 设置慢启动阈值为无限大
 	bbr->rtt_cnt = 0;
-	bbr->next_rtt_delivered = tp->delivered;
+	bbr->next_rtt_delivered = tp->delivered; // 记录下轮传输的起始点
 	bbr->prev_ca_state = TCP_CA_Open;
-	bbr->packet_conservation = 0;
+	bbr->packet_conservation = 0; // 关闭数据包守恒模式
 
-	bbr->probe_rtt_done_stamp = 0;
+	bbr->probe_rtt_done_stamp = 0; // 用于PROBE_RTT模式的定时控制
 	bbr->probe_rtt_round_done = 0;
 	bbr->min_rtt_us = tcp_min_rtt(tp);
 	bbr->min_rtt_stamp = tcp_jiffies32;
 
+    // 初始化带宽估计器，将最大带宽估计重置为0
 	minmax_reset(&bbr->bw, bbr->rtt_cnt, 0);  /* init max bw to 0 */
 
 	bbr->has_seen_rtt = 0;
-	bbr_init_pacing_rate_from_rtt(sk);
+	bbr_init_pacing_rate_from_rtt(sk); // 计算 sk->pacing_rate =  high_gain * init_cwnd / RTT
 
-	bbr->round_start = 0;
-	bbr->idle_restart = 0;
-	bbr->full_bw_reached = 0;
-	bbr->full_bw = 0;
-	bbr->full_bw_cnt = 0;
-	bbr->cycle_mstamp = 0;
-	bbr->cycle_idx = 0;
-	bbr_reset_lt_bw_sampling(sk);
-	bbr_reset_startup_mode(sk);
+	bbr->round_start = 0; // 标记新一轮传输未开始
+	bbr->idle_restart = 0; // 标记不是从空闲状态重启
+	bbr->full_bw_reached = 0; // 还未达到满带宽
+	bbr->full_bw = 0; // 满带宽估计为0
+	bbr->full_bw_cnt = 0; // 满带宽增长计数器
+	bbr->cycle_mstamp = 0; // 周期模式时间戳
+	bbr->cycle_idx = 0; // 周期索引
+	bbr_reset_lt_bw_sampling(sk); // 重置长期带宽采样
+	bbr_reset_startup_mode(sk); // 重置为STARTUP模式
 
-	bbr->ack_epoch_mstamp = tp->tcp_mstamp;
-	bbr->ack_epoch_acked = 0;
-	bbr->extra_acked_win_rtts = 0;
-	bbr->extra_acked_win_idx = 0;
-	bbr->extra_acked[0] = 0;
+	bbr->ack_epoch_mstamp = tp->tcp_mstamp; // ACK周期开始时间
+	bbr->ack_epoch_acked = 0; // ACK周期内确认的数据包数
+	bbr->extra_acked_win_rtts = 0; // 额外确认窗口的RTT数
+	bbr->extra_acked_win_idx = 0; // 额外确认窗口索引
+	bbr->extra_acked[0] = 0; // 额外确认数据包数组
 	bbr->extra_acked[1] = 0;
 
+    // pacing状态从NONE切换到NEEDED
+    // 这告诉网络栈这个连接需要使用pacing机制来控制发送速率
 	cmpxchg(&sk->sk_pacing_status, SK_PACING_NONE, SK_PACING_NEEDED);
 }
 
