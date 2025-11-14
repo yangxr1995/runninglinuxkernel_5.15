@@ -3366,6 +3366,11 @@ static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 		ca_rtt_us = tcp_stamp_us_delta(tp->tcp_mstamp, last_ackt);
 
         /* 判断是否为 “延迟 ACK”（即仅收到一个小报文） */
+        // 延迟 ACK 是接收方的一种优化策略：当收到单个数据报文时，不立即回复 ACK，而是等待一段短时间（通常 200ms 内），看看是否有 “捎带 ACK” 的机会（比如后续有数据要发给发送方，或再收到一个报文后合并 ACK），以减少网络开销。
+        // 判断方法:
+        //   确认数量：仅确认 1 个报文；
+        //   报文大小：被确认的是 “小报文”（小于 MSS）；
+        //   接收方状态：无乱序报文、无拥塞事件，无需立即回复 ACK。
 		if (pkts_acked == 1 && last_in_flight < tp->mss_cache &&
 		    last_in_flight && !prior_sacked && fully_acked &&
 		    sack->rate->prior_delivered + 1 == tp->delivered &&

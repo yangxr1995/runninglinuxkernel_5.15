@@ -225,6 +225,7 @@ static void try_bulk_dequeue_skb_slow(struct Qdisc *q,
 /* Note that dequeue_skb can possibly return a SKB list (via skb->next).
  * A requeued skb (via q->gso_skb) can also be a SKB list.
  */
+// 从Qdisc队列中出队数据包，支持GSO（Generic Segmentation Offload）数据包的重新排队，并优化批量出队性能。
 static struct sk_buff *dequeue_skb(struct Qdisc *q, bool *validate,
 				   int *packets)
 {
@@ -233,6 +234,7 @@ static struct sk_buff *dequeue_skb(struct Qdisc *q, bool *validate,
 
 	*packets = 1;
 	if (unlikely(!skb_queue_empty(&q->gso_skb))) {
+    // ### 1. 处理GSO重新排队数据包
 		spinlock_t *lock = NULL;
 
 		if (q->flags & TCQ_F_NOLOCK) {
@@ -283,6 +285,10 @@ validate:
 		return skb;
 	}
 
+    // ### 3. 常规数据包出队
+    // - 先检查`skb_bad_txq`队列（传输失败的数据包）
+    // - 如果是`SKB_XOFF_MAGIC`标识符，直接返回NULL
+    // - 否则调用具体Qdisc的出队函数
 	skb = qdisc_dequeue_skb_bad_txq(q);
 	if (unlikely(skb)) {
 		if (skb == SKB_XOFF_MAGIC)
@@ -292,6 +298,9 @@ validate:
 	skb = q->dequeue(q);
 	if (skb) {
 bulk:
+        // 4. 批量出队优化
+        // 快速路径：qdisc_may_bulk()返回true时使用批量出队
+        // 慢速路径：对于需要队列映射验证的情况使用`slow`版本
 		if (qdisc_may_bulk(q))
 			try_bulk_dequeue_skb(q, skb, txq, packets);
 		else
@@ -409,12 +418,12 @@ static inline bool qdisc_restart(struct Qdisc *q, int *packets)
 
 void __qdisc_run(struct Qdisc *q)
 {
-	int quota = dev_tx_weight;
+	int quota = dev_tx_weight; // 限制发送配额，防止占用cpu太久
 	int packets;
 
 	while (qdisc_restart(q, &packets)) {
 		quota -= packets;
-		if (quota <= 0) {
+		if (quota <= 0) { // 配额耗尽，设置软中断以重启队列规则
 			if (q->flags & TCQ_F_NOLOCK)
 				set_bit(__QDISC_STATE_MISSED, &q->state);
 			else

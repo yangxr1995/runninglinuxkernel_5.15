@@ -628,13 +628,20 @@ void qdisc_watchdog_init(struct qdisc_watchdog *wd, struct Qdisc *qdisc)
 }
 EXPORT_SYMBOL(qdisc_watchdog_init);
 
+// 调度qdisc看门狗定时器，在指定的时间后触发，以处理网络队列中的数据包。
 void qdisc_watchdog_schedule_range_ns(struct qdisc_watchdog *wd, u64 expires,
 				      u64 delta_ns)
 {
+    // **检查qdisc是否已停用：**
+    // 如果qdisc已被停用，直接返回，不调度定时器
+    // **目的：** 防止为已停用的队列规则设置定时器
 	if (test_bit(__QDISC_STATE_DEACTIVATED,
 		     &qdisc_root_sleeping(wd->qdisc)->state))
 		return;
 
+    // - 如果新请求的时间窗口与已存在的定时器重叠
+    // - 避免重新调度，直接返回
+    // - 减少不必要的定时器操作，提高性能
 	if (hrtimer_is_queued(&wd->timer)) {
 		/* If timer is already set in [expires, expires + delta_ns],
 		 * do not reprogram it.
@@ -643,7 +650,17 @@ void qdisc_watchdog_schedule_range_ns(struct qdisc_watchdog *wd, u64 expires,
 			return;
 	}
 
+    // **记录本次调度的到期时间：**
+    // - 用于下一次调度的比较
 	wd->last_expires = expires;
+    // ## 4. 启动高分辨率定时器
+    //- `&wd->timer`：定时器对象
+    // - `ns_to_ktime(expires)`：纳秒时间转换为内核时间格式
+    // - `delta_ns`：时间范围.delta_ns（允许的误差范围）
+    //     - 时间范围，允许的误差窗口
+    //     - 定时器可能在`[expires, expires + delta_ns]`期间触发
+    //     - 允许内核进行优化合并
+    // - `HRTIMER_MODE_ABS_PINNED`：绝对时间模式，固定在特定CPU上
 	hrtimer_start_range_ns(&wd->timer,
 			       ns_to_ktime(expires),
 			       delta_ns,

@@ -56,6 +56,7 @@
  * otherwise TCP stack falls back to an internal pacing using one high
  * resolution timer per TCP socket and may use more resources.
  */
+#include "linux/kernel.h"
 #include <linux/module.h>
 #include <net/tcp.h>
 #include <linux/inet_diag.h>
@@ -228,6 +229,7 @@ static bool bbr_full_bw_reached(const struct sock *sk)
 }
 
 /* Return the windowed max recent bandwidth sample, in pkts/uS << BW_SCALE. */
+// 使用滑动窗口最大滤波器得到的当前最大带宽
 static u32 bbr_max_bw(const struct sock *sk)
 {
 	struct bbr *bbr = inet_csk_ca(sk);
@@ -240,6 +242,7 @@ static u32 bbr_bw(const struct sock *sk)
 {
 	struct bbr *bbr = inet_csk_ca(sk);
 
+    // 当 `lt_use_bw = 1` 时，说明 BBR 检测到网络中存在流量限制器（policer）：
 	return bbr->lt_use_bw ? bbr->lt_bw : bbr_max_bw(sk);
 }
 
@@ -312,10 +315,20 @@ static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
+    // 根据预测带宽和增益计算下周期的发送速率
 	unsigned long rate = bbr_bw_to_pacing_rate(sk, bw, gain);
 
+    // 第一次获得RTT样本时
+    // 使用初始带宽和高增益计算rate，以快速启动
 	if (unlikely(!bbr->has_seen_rtt && tp->srtt_us))
 		bbr_init_pacing_rate_from_rtt(sk);
+    // 速率更新，两种条件
+    // 条件1：
+    //   带宽已满,进入稳态, 允许更新任何值，以适应网络条件变化
+    // 条件2：
+    //   速率增长，带宽只增不减，以满足:
+    //     STARTUP 阶段：快速增加速率填充管道
+    //     PROBE_BW 阶段：在增益循环中高增益时增加速率
 	if (bbr_full_bw_reached(sk) || rate > sk->sk_pacing_rate)
 		sk->sk_pacing_rate = rate;
 }
@@ -396,6 +409,7 @@ static void bbr_cwnd_event(struct sock *sk, enum tcp_ca_event event)
  * measurements (e.g., delayed ACKs or other ACK compression effects). This
  * noise may cause BBR to under-estimate the rate.
  */
+// 计算基于最小RTT和估计瓶颈带宽的带宽延迟积（BDP）。
 static u32 bbr_bdp(struct sock *sk, u32 bw, int gain)
 {
 	struct bbr *bbr = inet_csk_ca(sk);
@@ -408,6 +422,8 @@ static u32 bbr_bdp(struct sock *sk, u32 bw, int gain)
 	 * ACKed so far. In this case, an RTO can cut cwnd to 1, in which
 	 * case we need to slow-start up toward something safe: TCP_INIT_CWND.
 	 */
+   // - 当没有有效RTT样本时返回默认初始窗口（10 MSS）
+   // - 防止RTO后窗口收缩过小
 	if (unlikely(bbr->min_rtt_us == ~0U))	 /* no valid RTT samples yet? */
 		return TCP_INIT_CWND;  /* be safe: cap at default initial cwnd*/
 
@@ -528,23 +544,36 @@ static bool bbr_set_cwnd_to_recover_or_restore(
 	 * in two steps. First, here we deduct the number of lost packets.
 	 * Then, in bbr_set_cwnd() we slow start up toward the target cwnd.
 	 */
+    // 丢包窗口调整
+    // 根据丢包数量减少当前cwnd
+    // 确保cwnd至少为1，避免完全停止传输
+    // 这是对当前发送窗口的初步调整
 	if (rs->losses > 0)
 		cwnd = max_t(s32, cwnd - rs->losses, 1);
 
+    // Packet Conservation原理：
+    // - 原则：确认P个数据包，就应发送P个新数据包
+    // - 当前cwnd设为：`在途数据包数 + 本次确认的包数`
+    // - 确保"一个ACK对应一个发送"（丢包恢复期间保守策略）
+    // - 防止过度增加窗口导致更多丢包
 	if (state == TCP_CA_Recovery && prev_state != TCP_CA_Recovery) {
+        // 进入恢复模式
 		/* Starting 1st round of Recovery, so do packet conservation. */
-		bbr->packet_conservation = 1;
-		bbr->next_rtt_delivered = tp->delivered;  /* start round now */
+		bbr->packet_conservation = 1; // // 启用packet conservation
+		bbr->next_rtt_delivered = tp->delivered; // 标记本轮开始  /* start round now */
 		/* Cut unused cwnd from app behavior, TSQ, or TSO deferral: */
-		cwnd = tcp_packets_in_flight(tp) + acked;
+		cwnd = tcp_packets_in_flight(tp) + acked; // // 应用packet conservation
 	} else if (prev_state >= TCP_CA_Recovery && state < TCP_CA_Recovery) {
+        // 退出恢复模式
 		/* Exiting loss recovery; restore cwnd saved before recovery. */
-		cwnd = max(cwnd, bbr->prior_cwnd);
-		bbr->packet_conservation = 0;
+		cwnd = max(cwnd, bbr->prior_cwnd); // 恢复保存的cwnd
+		bbr->packet_conservation = 0; // 关闭packet conservation
 	}
-	bbr->prev_ca_state = state;
+	bbr->prev_ca_state = state; // 更新保存的CA状态用于下次判断
 
 	if (bbr->packet_conservation) {
+        // 确保cwnd不低于`在途包数 + 确认包数`
+        // 严格控制窗口增长，防止丢包加剧
 		*new_cwnd = max(cwnd, tcp_packets_in_flight(tp) + acked);
 		return true;	/* yes, using packet conservation */
 	}
@@ -565,26 +594,44 @@ static void bbr_set_cwnd(struct sock *sk, const struct rate_sample *rs,
 	if (!acked)
 		goto done;  /* no packet fully ACKed; just apply caps */
 
+    // 在丢包恢复期间，使用特殊逻辑处理窗口
+    // 严格控制窗口增长，防止丢包加剧
 	if (bbr_set_cwnd_to_recover_or_restore(sk, rs, acked, &cwnd))
 		goto done;
 
+    // 计算目标窗口
+    //  考虑最小RTT和当前带宽估计
+    //  根据增益因子调整窗口大小
 	target_cwnd = bbr_bdp(sk, bw, gain);
 
 	/* Increment the cwnd to account for excess ACKed data that seems
 	 * due to aggregation (of data and/or ACKs) visible in the ACK stream.
 	 */
+    // 计算ACK压缩导致的额外窗口
 	target_cwnd += bbr_ack_aggregation_cwnd(sk);
+    // 确保窗口大小满足TSO段要求
+    // 考虑不同速率下TSO最优段数
 	target_cwnd = bbr_quantization_budget(sk, target_cwnd);
 
 	/* If we're below target cwnd, slow start cwnd toward target cwnd. */
+    // 慢启动
+    // - 达到满带宽后：使用精确增长，不超过目标窗口
+    // - 未达到满带宽或初始窗口：使用慢启动算法，指数增长
+    // - 初始窗口特殊处理（确保至少发送TCP_INIT_CWND字节）
 	if (bbr_full_bw_reached(sk))  /* only cut cwnd if we filled the pipe */
 		cwnd = min(cwnd + acked, target_cwnd);
 	else if (cwnd < target_cwnd || tp->delivered < TCP_INIT_CWND)
 		cwnd = cwnd + acked;
+    // 最小窗口保证
+    // - 确保cwnd至少为4（bbr_cwnd_min_target）
+    // - 即使在低带宽或高延迟情况下也保持最小传输能力
 	cwnd = max(cwnd, bbr_cwnd_min_target);
 
 done:
-	tp->snd_cwnd = min(cwnd, tp->snd_cwnd_clamp);	/* apply global cap */
+	tp->snd_cwnd = min(cwnd, tp->snd_cwnd_clamp); // 应用层设置的窗口限制	/* apply global cap */
+    // 考虑 PROBE_RTT阶段 排空                                                 //
+    // - 在探测最小RTT模式（BBR_PROBE_RTT）时强制最小窗口
+    // - 确保队列完全排空以便测量真实传播延迟
 	if (bbr->mode == BBR_PROBE_RTT)  /* drain queue, refresh min_rtt */
 		tp->snd_cwnd = min(tp->snd_cwnd, bbr_cwnd_min_target);
 }
@@ -695,6 +742,9 @@ static void bbr_reset_lt_bw_sampling(struct sock *sk)
 }
 
 /* Long-term bw sampling interval is done. Estimate whether we're policed. */
+// 判断是否检测到流量 policer
+// 判断当前采样间隔的带宽是否与之前的长期带宽估计一致，如果一致则确认检测到 policer。
+// 一旦检测到policer，调速增益设为1.0，避免超出限制导致丢包
 static void bbr_lt_bw_interval_done(struct sock *sk, u32 bw)
 {
 	struct bbr *bbr = inet_csk_ca(sk);
@@ -707,15 +757,16 @@ static void bbr_lt_bw_interval_done(struct sock *sk, u32 bw)
 		    (bbr_rate_bytes_per_sec(sk, diff, BBR_UNIT) <=
 		     bbr_lt_bw_diff)) {
 			/* All criteria are met; estimate we're policed. */
-			bbr->lt_bw = (bw + bbr->lt_bw) >> 1;  /* avg 2 intvls */
-			bbr->lt_use_bw = 1;
-			bbr->pacing_gain = BBR_UNIT;  /* try to avoid drops */
+            // 检测到policer
+			bbr->lt_bw = (bw + bbr->lt_bw) >> 1; // 平均带宽  /* avg 2 intvls */
+			bbr->lt_use_bw = 1; // 启用长期带宽
+			bbr->pacing_gain = BBR_UNIT; // 调整调速增益1.0 /* try to avoid drops */
 			bbr->lt_rtt_cnt = 0;
 			return;
 		}
 	}
-	bbr->lt_bw = bw;
-	bbr_reset_lt_bw_sampling_interval(sk);
+	bbr->lt_bw = bw; // 将当前带宽设为初始长期带宽估计
+	bbr_reset_lt_bw_sampling_interval(sk); // 重置采样间隔，准备下一次采样
 }
 
 /* Token-bucket traffic policers are common (see "An Internet-Wide Analysis of
@@ -733,6 +784,8 @@ static void bbr_lt_bw_sampling(struct sock *sk, const struct rate_sample *rs)
 	u64 bw;
 	u32 t;
 
+    // 如果已经使用长期带宽估计，监控使用时间
+    // 达到最大RTT计数后重置采样和探测模式
 	if (bbr->lt_use_bw) {	/* already using long-term rate, lt_bw? */
 		if (bbr->mode == BBR_PROBE_BW && bbr->round_start &&
 		    ++bbr->lt_rtt_cnt >= bbr_lt_bw_max_rtts) {
@@ -746,6 +799,9 @@ static void bbr_lt_bw_sampling(struct sock *sk, const struct rate_sample *rs)
 	 * its tokens and estimate the steady-state rate allowed by the policer.
 	 * Starting samples earlier includes bursts that over-estimate the bw.
 	 */
+    // 等待第一次丢包才开始采样
+    // 原因：让 policer 耗尽其令牌，估计稳态允许的速率
+    // 过早开始采样会包含突发流量，导致带宽高估
 	if (!bbr->lt_is_sampling) {
 		if (!rs->losses)
 			return;
@@ -759,6 +815,8 @@ static void bbr_lt_bw_sampling(struct sock *sk, const struct rate_sample *rs)
 		return;
 	}
 
+    // 采样窗口：4-16个RTT之间
+    // 避免采样间隔太短或太长
 	if (bbr->round_start)
 		bbr->lt_rtt_cnt++;	/* count round trips in this interval */
 	if (bbr->lt_rtt_cnt < bbr_lt_intvl_min_rtts)
@@ -772,6 +830,8 @@ static void bbr_lt_bw_sampling(struct sock *sk, const struct rate_sample *rs)
 	 * policer tokens were exhausted. Stopping the sampling before the
 	 * tokens are exhausted under-estimates the policed rate.
 	 */
+    // 采样在丢包时结束，估算 policer 令牌耗尽时的速率
+    // 检查丢包率是否超过阈值（默认20%）
 	if (!rs->losses)
 		return;
 
@@ -782,6 +842,8 @@ static void bbr_lt_bw_sampling(struct sock *sk, const struct rate_sample *rs)
 	if (!delivered || (lost << BBR_SCALE) < bbr_lt_loss_thresh * delivered)
 		return;
 
+    // 计算采样间隔内的平均交付速率
+    // 使用 BW_UNIT 缩放因子避免整数除法精度损失
 	/* Find average delivery rate in this sampling interval. */
 	t = div_u64(tp->delivered_mstamp, USEC_PER_MSEC) - bbr->lt_last_stamp;
 	if ((s32)t < 1)
@@ -804,24 +866,29 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 	struct bbr *bbr = inet_csk_ca(sk);
 	u64 bw;
 
-	bbr->round_start = 0;
-	if (rs->delivered < 0 || rs->interval_us <= 0)
+	bbr->round_start = 0; // 重置本轮传输标记为0
+	if (rs->delivered < 0 || rs->interval_us <= 0) // 过滤无效样本
 		return; /* Not a valid observation */
 
+    trace_printk("%s:rs->prior_delivered[%d]bbr->next_rtt_delivered[%d]tp->delivered[%d]",
+            __FUNCTION__, rs->prior_delivered, bbr->next_rtt_delivered, tp->delivered);
 	/* See if we've reached the next RTT */
-	if (!before(rs->prior_delivered, bbr->next_rtt_delivered)) {
-		bbr->next_rtt_delivered = tp->delivered;
+    // rs->prior_delivered >= bbr->next_rtt_delivered
+	if (!before(rs->prior_delivered, bbr->next_rtt_delivered)) { // 
+		bbr->next_rtt_delivered = tp->delivered; // 更新下一轮的目标delivery值
 		bbr->rtt_cnt++;
-		bbr->round_start = 1;
-		bbr->packet_conservation = 0;
+		bbr->round_start = 1; // 标记本轮开始
+		bbr->packet_conservation = 0; // 关闭packet conservation模式
 	}
 
+    // 进行长期带宽采样
 	bbr_lt_bw_sampling(sk, rs);
 
 	/* Divide delivered by the interval to find a (lower bound) bottleneck
 	 * bandwidth sample. Delivered is in packets and interval_us in uS and
 	 * ratio will be <<1 for most connections. So delivered is first scaled.
 	 */
+    // 计算当前带宽样本 : 每微秒传输的数据包数量
 	bw = div64_long((u64)rs->delivered * BW_UNIT, rs->interval_us);
 
 	/* If this sample is application-limited, it is likely to have a very
@@ -835,6 +902,8 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 	 * network rate no matter how long. We automatically leave this
 	 * phase when app writes faster than the network can deliver :)
 	 */
+    // 不是应用层限制: 最大带宽可增加可减少
+    // 是应用层限制: 只更新带宽增加的情况
 	if (!rs->is_app_limited || bw >= bbr_max_bw(sk)) {
 		/* Incorporate new sample into our max bw filter. */
 		minmax_running_max(&bbr->bw, bbr_bw_rtts, bbr->rtt_cnt, bw);
@@ -919,12 +988,17 @@ static void bbr_check_full_bw_reached(struct sock *sk,
 	if (bbr_full_bw_reached(sk) || !bbr->round_start || rs->is_app_limited)
 		return;
 
+    // `bbr->full_bw`：保存的最近一次确认的高带宽值
+    // `bbr_full_bw_thresh = 1.25`：25%增长阈值
+    // 计算公式：bw_thresh = full_bw * 1.25
 	bw_thresh = (u64)bbr->full_bw * bbr_full_bw_thresh >> BBR_SCALE;
-	if (bbr_max_bw(sk) >= bw_thresh) {
-		bbr->full_bw = bbr_max_bw(sk);
-		bbr->full_bw_cnt = 0;
+	if (bbr_max_bw(sk) >= bw_thresh) { // 带宽增长判断
+		bbr->full_bw = bbr_max_bw(sk); // 更新高带宽记录
+		bbr->full_bw_cnt = 0; // 重置计数器
 		return;
 	}
+    // 满带宽检测
+    // 连续3次不满足25%增长，则认为管道已满
 	++bbr->full_bw_cnt;
 	bbr->full_bw_reached = bbr->full_bw_cnt >= bbr_full_bw_cnt;
 }
@@ -950,6 +1024,7 @@ static void bbr_check_probe_rtt_done(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
 
+    // 200ms 到达
 	if (!(bbr->probe_rtt_done_stamp &&
 	      after(tcp_jiffies32, bbr->probe_rtt_done_stamp)))
 		return;
@@ -985,15 +1060,19 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	bool filter_expired;
 
 	/* Track min RTT seen in the min_rtt_win_sec filter window: */
+    // 以10s为窗口周期，
+    // 获得窗口内最小rtt，作为链路降噪后的RTT
+    // 超过窗口后，以首个非延迟的RTT样本作为新的基准，确保RTT的新鲜
 	filter_expired = after(tcp_jiffies32,
 			       bbr->min_rtt_stamp + bbr_min_rtt_win_sec * HZ);
 	if (rs->rtt_us >= 0 &&
-	    (rs->rtt_us < bbr->min_rtt_us ||
-	     (filter_expired && !rs->is_ack_delayed))) {
-		bbr->min_rtt_us = rs->rtt_us;
+	    (rs->rtt_us < bbr->min_rtt_us || // 窗口未过期，且发现更小的rtt
+	     (filter_expired && !rs->is_ack_delayed))) { // 窗口过期，接受第一个非延迟的RTT
+		bbr->min_rtt_us = rs->rtt_us; // 最小RTT更新
 		bbr->min_rtt_stamp = tcp_jiffies32;
 	}
 
+    // 触发 PROBE_RTT
 	if (bbr_probe_rtt_mode_ms > 0 && filter_expired &&
 	    !bbr->idle_restart && bbr->mode != BBR_PROBE_RTT) {
 		bbr->mode = BBR_PROBE_RTT;  /* dip, drain queue */
@@ -1003,16 +1082,24 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 
 	if (bbr->mode == BBR_PROBE_RTT) {
 		/* Ignore low rate samples during this mode. */
+        // 在 PROBE_RTT 期间为低速率阶段, 开启 app_limited ，避免影响带宽估计
 		tp->app_limited =
 			(tp->delivered + tcp_packets_in_flight(tp)) ? : 1;
 		/* Maintain min packets in flight for max(200 ms, 1 round). */
+        // probe_rtt 进入条件检查
+        // 维持最小在途数据包
 		if (!bbr->probe_rtt_done_stamp &&
+                // 至少4个数据包
 		    tcp_packets_in_flight(tp) <= bbr_cwnd_min_target) {
+            // 至少维持200ms
 			bbr->probe_rtt_done_stamp = tcp_jiffies32 +
 				msecs_to_jiffies(bbr_probe_rtt_mode_ms);
+            // probe_rtt 阶段标记为未完成
 			bbr->probe_rtt_round_done = 0;
+            // 至少基于一个数据包的RTT
 			bbr->next_rtt_delivered = tp->delivered;
-		} else if (bbr->probe_rtt_done_stamp) {
+		} else if (bbr->probe_rtt_done_stamp) { 
+            // probe_rtt 完成条件检查
 			if (bbr->round_start)
 				bbr->probe_rtt_round_done = 1;
 			if (bbr->probe_rtt_round_done)
@@ -1055,13 +1142,44 @@ static void bbr_update_gains(struct sock *sk)
 
 static void bbr_update_model(struct sock *sk, const struct rate_sample *rs)
 {
-	bbr_update_bw(sk, rs);
-	bbr_update_ack_aggregation(sk, rs);
-	bbr_update_cycle_phase(sk, rs);
-	bbr_check_full_bw_reached(sk, rs);
-	bbr_check_drain(sk, rs);
-	bbr_update_min_rtt(sk, rs);
-	bbr_update_gains(sk);
+    // 更新带宽估计：
+    // - 计算当前 ACK 确认的数据包数量和确认时间间隔
+    // - 通过 `delivered/interval_us` 计算瞬时传输速率
+    // - 使用滑动窗口最大滤波器维护带宽估计
+    // - 处理长期带宽采样，用于检测流量限制器
+    bbr_update_bw(sk, rs);
+    // 更新 ACK 聚合估计：
+    // - 估计由于 ACK 聚合（如延迟 ACK、ACK 压缩）导致的额外确认数据
+    // - 计算 `extra_acked` 用于增加拥塞窗口
+    // - 这有助于在 ACK 之间保持合理的发送速率
+    bbr_update_ack_aggregation(sk, rs);
+    // 更新探测带宽阶段的增益循环：
+    // - 在 BBR_PROBE_BW 模式下，循环使用不同的 pacing_gain
+    // - 根据 `bbr_pacing_gain[]` 数组的值（1.25, 0.75, 1.0 等）进行带宽探测
+    // - 平衡带宽利用和公平性
+    bbr_update_cycle_phase(sk, rs);
+    // 检查是否达到满带宽：
+    // - 在 BBR_STARTUP 阶段检测带宽增长是否趋于稳定
+    // - 如果连续 3 轮 RTT 带宽增长小于 25%，认为管道已满
+    // - 触发从 STARTUP 模式转换到 DRAIN/PROBE_BW 模式
+    bbr_check_full_bw_reached(sk, rs);
+    // 检查是否需要排空队列：
+    // - 在 STARTUP 模式达到满带宽后，切换到 DRAIN 模式
+    // - 排空 STARTUP 阶段积累的队列
+    // - 当队列基本清空后，切换到 PROBE_BW 稳态模式
+    bbr_check_drain(sk, rs);
+    // 更新最小 RTT 估计：
+    // - 维护 10 秒窗口内的最小 RTT
+    // - 当时钟窗口过期时，触发 PROBE_RTT 模式
+    // - 在 PROBE_RTT 模式下最小化在途数据包以测量真实传播延迟
+    bbr_update_min_rtt(sk, rs);
+    // 更新增益参数：
+    // - 根据当前 BBR 模式设置 pacing_gain 和 cwnd_gain
+    // - STARTUP: 高增益（2.885）快速填充管道
+    // - DRAIN: 排水增益（0.347）清空队列
+    // - PROBE_BW: 循环增益探测和利用带宽
+    // - PROBE_RTT: 单位增益保持最小队列
+    bbr_update_gains(sk);
 }
 
 static void bbr_main(struct sock *sk, const struct rate_sample *rs)

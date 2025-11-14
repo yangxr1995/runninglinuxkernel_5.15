@@ -2718,6 +2718,7 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
 
         // 如果数据包过长，进行分段处理以适应 MSS 限制
 		limit = mss_now;
+        // 若skb需要超过一个的分段，则需要根据 max_segs等获得最多能发多少
 		if (tso_segs > 1 && !tcp_urg_mode(tp))
 			limit = tcp_mss_split_point(sk, skb, mss_now,
 						    min_t(unsigned int,
