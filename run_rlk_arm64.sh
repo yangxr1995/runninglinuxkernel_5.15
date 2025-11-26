@@ -15,7 +15,8 @@ rootfs_image=$PWD/rootfs_debian_arm64.ext4
 rootfs_size=2048
 SMP="-smp 4"
 
-QEMU=qemu-system-aarch64-6.2
+# QEMU=qemu-system-aarch64-6.2
+QEMU=qemu-system-aarch64
 
 rootfs_arg="root=/dev/vda rootfstype=ext4 rw"
 kernel_arg="noinintrd nokaslr"
