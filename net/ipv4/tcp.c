@@ -1390,6 +1390,7 @@ new_segment:
 
 		WRITE_ONCE(tp->write_seq, tp->write_seq + copy);
 		TCP_SKB_CB(skb)->end_seq += copy;
+        trace_printk("tp->write_seq += copy[%d]", copy);
 		tcp_skb_pcount_set(skb, 0);
 
 		copied += copy;

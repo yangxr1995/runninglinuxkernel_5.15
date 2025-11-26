@@ -282,6 +282,7 @@ static unsigned long bbr_bw_to_pacing_rate(struct sock *sk, u32 bw, int gain)
 	u64 rate = bw;
 
 	rate = bbr_rate_bytes_per_sec(sk, rate, gain);
+    trace_printk("rate[%llu] bw[%d] gain[%d] sk_pacing_rate[%lu]", rate, bw, gain, sk->sk_pacing_rate);
     // sk_max_pacing_rate : 默认为无限大，可以通过 setsockopt 配置
 	rate = min_t(u64, rate, sk->sk_max_pacing_rate);
 	return rate; // 返回 估算发送速率 字节/s
@@ -308,6 +309,7 @@ static void bbr_init_pacing_rate_from_rtt(struct sock *sk)
 	do_div(bw, rtt_us);
     // bbr_bw_to_pacing_rate 内部会将 rate >> BW_SCALE ，以去掉缩放因子的影响
 	sk->sk_pacing_rate = bbr_bw_to_pacing_rate(sk, bw, bbr_high_gain);
+    trace_printk("init sk_pacing_rate[%ld]", sk->sk_pacing_rate);
 }
 
 /* Pace using current bw estimate and a gain factor. */
@@ -329,8 +331,10 @@ static void bbr_set_pacing_rate(struct sock *sk, u32 bw, int gain)
     //   速率增长，带宽只增不减，以满足:
     //     STARTUP 阶段：快速增加速率填充管道
     //     PROBE_BW 阶段：在增益循环中高增益时增加速率
-	if (bbr_full_bw_reached(sk) || rate > sk->sk_pacing_rate)
+	if (bbr_full_bw_reached(sk) || rate > sk->sk_pacing_rate) {
 		sk->sk_pacing_rate = rate;
+        trace_printk("update sk_pacing_rate[%ld]", sk->sk_pacing_rate);
+    }
 }
 
 /* override sysctl_tcp_min_tso_segs */
@@ -870,8 +874,6 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 	if (rs->delivered < 0 || rs->interval_us <= 0) // 过滤无效样本
 		return; /* Not a valid observation */
 
-    trace_printk("%s:rs->prior_delivered[%d]bbr->next_rtt_delivered[%d]tp->delivered[%d]",
-            __FUNCTION__, rs->prior_delivered, bbr->next_rtt_delivered, tp->delivered);
 	/* See if we've reached the next RTT */
     // rs->prior_delivered >= bbr->next_rtt_delivered
 	if (!before(rs->prior_delivered, bbr->next_rtt_delivered)) { // 
@@ -890,6 +892,8 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 	 */
     // 计算当前带宽样本 : 每微秒传输的数据包数量
 	bw = div64_long((u64)rs->delivered * BW_UNIT, rs->interval_us);
+    trace_printk("bw[%llu] delivered[%d] interval_us[%lu]",
+            bw, rs->delivered, rs->interval_us);
 
 	/* If this sample is application-limited, it is likely to have a very
 	 * low delivered count that represents application behavior rather than
@@ -907,6 +911,7 @@ static void bbr_update_bw(struct sock *sk, const struct rate_sample *rs)
 	if (!rs->is_app_limited || bw >= bbr_max_bw(sk)) {
 		/* Incorporate new sample into our max bw filter. */
 		minmax_running_max(&bbr->bw, bbr_bw_rtts, bbr->rtt_cnt, bw);
+        trace_printk("update max_bw[%d]", bbr_max_bw(sk));
 	}
 }
 
@@ -985,6 +990,9 @@ static void bbr_check_full_bw_reached(struct sock *sk,
 	struct bbr *bbr = inet_csk_ca(sk);
 	u32 bw_thresh;
 
+    trace_printk("bbr_full_bw_reached[%d] bbr->round_start[%d] rs->is_app_limited[%d]",
+            bbr_full_bw_reached(sk), bbr->round_start, rs->is_app_limited);
+
 	if (bbr_full_bw_reached(sk) || !bbr->round_start || rs->is_app_limited)
 		return;
 
@@ -995,12 +1003,17 @@ static void bbr_check_full_bw_reached(struct sock *sk,
 	if (bbr_max_bw(sk) >= bw_thresh) { // 带宽增长判断
 		bbr->full_bw = bbr_max_bw(sk); // 更新高带宽记录
 		bbr->full_bw_cnt = 0; // 重置计数器
+        trace_printk("bbr_max_bw[%u] >= bw_thresh[%u]", bbr_max_bw(sk), bw_thresh);
 		return;
 	}
+    trace_printk("bbr_max_bw[%u] < bw_thresh[%u]", bbr_max_bw(sk), bw_thresh);
     // 满带宽检测
     // 连续3次不满足25%增长，则认为管道已满
 	++bbr->full_bw_cnt;
 	bbr->full_bw_reached = bbr->full_bw_cnt >= bbr_full_bw_cnt;
+    if (bbr->full_bw_reached) {
+        trace_printk("bbr full_bw_reached!!!");
+    }
 }
 
 /* If pipe is probably full, drain the queue and then enter steady-state. */
@@ -1109,6 +1122,8 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	/* Restart after idle ends only once we process a new S/ACK for data */
 	if (rs->delivered > 0)
 		bbr->idle_restart = 0;
+
+    trace_printk("%s min_rtt_us[%d] rtt_us[%lu]", __FUNCTION__, bbr->min_rtt_us, rs->rtt_us);
 }
 
 static void bbr_update_gains(struct sock *sk)
@@ -1119,20 +1134,24 @@ static void bbr_update_gains(struct sock *sk)
 	case BBR_STARTUP:
 		bbr->pacing_gain = bbr_high_gain;
 		bbr->cwnd_gain	 = bbr_high_gain;
+        trace_printk("BBR_STARTUP pacing_gain[%u]", bbr->pacing_gain);
 		break;
 	case BBR_DRAIN:
 		bbr->pacing_gain = bbr_drain_gain;	/* slow, to drain */
 		bbr->cwnd_gain	 = bbr_high_gain;	/* keep cwnd */
+        trace_printk("BBR_DRAIN pacing_gain[%u]", bbr->pacing_gain);
 		break;
 	case BBR_PROBE_BW:
 		bbr->pacing_gain = (bbr->lt_use_bw ?
 				    BBR_UNIT :
 				    bbr_pacing_gain[bbr->cycle_idx]);
 		bbr->cwnd_gain	 = bbr_cwnd_gain;
+        trace_printk("BBR_PROBE_BW pacing_gain[%u]", bbr->pacing_gain);
 		break;
 	case BBR_PROBE_RTT:
 		bbr->pacing_gain = BBR_UNIT;
 		bbr->cwnd_gain	 = BBR_UNIT;
+        trace_printk("BBR_PROBE_RTT pacing_gain[%u]", bbr->pacing_gain);
 		break;
 	default:
 		WARN_ONCE(1, "BBR bad mode: %u\n", bbr->mode);
@@ -1255,6 +1274,7 @@ static u32 bbr_undo_cwnd(struct sock *sk)
 	bbr->full_bw = 0;   /* spurious slow-down; reset full pipe detection */
 	bbr->full_bw_cnt = 0;
 	bbr_reset_lt_bw_sampling(sk);
+    trace_printk("full_bw[0]");
 	return tcp_sk(sk)->snd_cwnd;
 }
 
@@ -1297,6 +1317,7 @@ static void bbr_set_state(struct sock *sk, u8 new_state)
 		bbr->prev_ca_state = TCP_CA_Loss;
 		bbr->full_bw = 0;
 		bbr->round_start = 1;	/* treat RTO like end of a round */
+        trace_printk("full_bw[0]");
 		bbr_lt_bw_sampling(sk, &rs);
 	}
 }

@@ -2499,6 +2499,11 @@ static inline bool tcp_may_undo(const struct tcp_sock *tp)
 	return tp->undo_marker && (!tp->undo_retrans || tcp_packet_delayed(tp));
 }
 
+// 这个函数体现了 TCP 拥塞控制的"回退"机制：
+// - 当快速重传/恢复被证明是错误的时候，可以撤销拥塞窗口减少
+// - 避免过度保守导致的性能损失
+// - 针对不同算法（Reno vs SACK）有不同的处理逻辑
+// - 包含统计和调试支持
 /* People celebrate: "We love our President!" */
 static bool tcp_try_undo_recovery(struct sock *sk)
 {
@@ -3829,7 +3834,7 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	sack_state.rate = &rs;
 	sack_state.sack_delivered = 0;
 
-	/* We very likely will need to access rtx queue. */
+    /* We very likely will need to access rtx queue. */
 	prefetch(sk->tcp_rtx_queue.rb_node);
 
     // 1) 合法性检查
@@ -5864,6 +5869,7 @@ discard:
  *	the rest is checked inline. Fast processing is turned on in
  *	tcp_data_queue when everything is OK.
  */
+// TCP 状态为 ESTABLISHED 时接收数据报的核心入口**，它把收到的 `skb`（报文）分为 **快路径（fast‑path）** 与 **慢路径（slow‑path）** 两类进行处理。
 void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 {
 	const struct tcphdr *th = (const struct tcphdr *)skb->data;
@@ -5874,6 +5880,7 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 	trace_tcp_probe(sk, skb);
 
 	tcp_mstamp_refresh(tp);
+
 	if (unlikely(!sk->sk_rx_dst))
 		inet_csk(sk)->icsk_af_ops->sk_rx_dst_set(sk, skb);
 	/*
@@ -5902,6 +5909,7 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 	 *	PSH flag is ignored.
 	 */
 
+    //  2. 快路径（Fast Path）— 条件检查
 	if ((tcp_flag_word(th) & TCP_HP_BITS) == tp->pred_flags &&
 	    TCP_SKB_CB(skb)->seq == tp->rcv_nxt &&
 	    !after(TCP_SKB_CB(skb)->ack_seq, tp->snd_nxt)) {
@@ -5929,6 +5937,7 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 			 */
 		}
 
+        // 2.3 纯 ACK（仅 ACK、没有载荷）的情况
 		if (len <= tcp_header_len) {
 			/* Bulk data transfer: sender */
 			if (len == tcp_header_len) {
@@ -5944,6 +5953,7 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 				/* We know that such packets are checksummed
 				 * on entry.
 				 */
+                // 只收 ACK，调用 tcp_ack() 更新发送窗口、状态
 				tcp_ack(sk, skb, 0);
 				__kfree_skb(skb);
 				tcp_data_snd_check(sk);

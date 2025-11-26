@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#include "linux/kernel.h"
 #include <net/tcp.h>
 
 /* The bandwidth estimator estimates the rate at which the network
@@ -62,8 +63,7 @@ void tcp_rate_skb_sent(struct sock *sk, struct sk_buff *skb)
 
 		tp->first_tx_mstamp  = tstamp_us; // 以第一个数据包的发送时间做链路snd侧基准时间
 		tp->delivered_mstamp = tstamp_us; // 以第一个数据包的发送时间做链路ack侧基准时间
-        trace_printk("%d:%s:snd_phase_id[%d]start at first_tx_mstamp[%llu] tp->delivered_mstamp[%llu]\n", 
-                current->pid, __FUNCTION__, ++cycle_id, tstamp_us, tstamp_us);
+        trace_printk("start tx first_tx_mstamp[%llu]us", tstamp_us);
 	}
 
     // 记录快照
@@ -71,6 +71,11 @@ void tcp_rate_skb_sent(struct sock *sk, struct sk_buff *skb)
 	TCP_SKB_CB(skb)->tx.delivered_mstamp	= tp->delivered_mstamp; // ack侧基准时间
 	TCP_SKB_CB(skb)->tx.delivered		= tp->delivered; // 基准交付量
 	TCP_SKB_CB(skb)->tx.is_app_limited	= tp->app_limited ? 1 : 0;
+
+    trace_printk("skb.app_limited[%d] snd_us_base[%llu] ack_us_base[%llu]\n", 
+            TCP_SKB_CB(skb)->tx.is_app_limited,
+            TCP_SKB_CB(skb)->tx.first_tx_mstamp,
+            TCP_SKB_CB(skb)->tx.delivered_mstamp);
 }
 
 /* When an skb is sacked or acked, we fill in the rate sample with the (prior)
@@ -131,8 +136,11 @@ void tcp_rate_gen(struct sock *sk, u32 delivered, u32 lost,
 
 	/* Clear app limited if bubble is acked and gone. */
     // 如果有链路气泡，需要等待导致气泡的报文(或之后的报文)的ACK抵达，链路中的气泡才排空
-	if (tp->app_limited && after(tp->delivered, tp->app_limited))
+	if (tp->app_limited && after(tp->delivered, tp->app_limited)) {
+        trace_printk("app_limited end tp->delivered[%d] > tp->app_limited[%d]", 
+                tp->delivered, tp->app_limited);
 		tp->app_limited = 0;
+    }
 
 	/* TODO: there are multiple places throughout tcp_ack() to get
 	 * current time. Refactor the code using a new "tcp_acktag_state"
@@ -166,6 +174,7 @@ void tcp_rate_gen(struct sock *sk, u32 delivered, u32 lost,
 	snd_us = rs->interval_us; // snd阶段的时间:数据包发送的持续时间 /* send phase */
 	ack_us = tcp_stamp_us_delta(tp->tcp_mstamp,
 				    rs->prior_mstamp); // ack阶段的时间:最近的接受ack时间 - 上次的接受ack的时间
+
 	rs->interval_us = max(snd_us, ack_us); // 以最大值做样本时间
 
 	/* Record both segment send and ack receive intervals */
@@ -217,9 +226,21 @@ void tcp_rate_check_app_limited(struct sock *sk)
         // 3. 飞行中的数据包数量小于拥塞窗口大小
 	    tcp_packets_in_flight(tp) < tp->snd_cwnd &&
         // 4. 所有丢失数据包都已被重传
-	    tp->lost_out <= tp->retrans_out)
+	    tp->lost_out <= tp->retrans_out) {
         // 如果当前有已交付或在途的数据包，使用该数量作为app_limited值
 		tp->app_limited =
 			(tp->delivered + tcp_packets_in_flight(tp)) ? : 1;
+        trace_printk("app_limited start[%d] ",  tp->app_limited);
+    }
+
+    trace_printk("app_limited check[%d] nonext[%d] in_flight[%d] snd_cwnd[%d] noqlen[%d] write_seq[%u] - snd_nxt[%u] = [%u] tp->mss_cache[%u] ", 
+            tp->app_limited, 
+            tp->write_seq - tp->snd_nxt < tp->mss_cache,
+            tcp_packets_in_flight(tp), tp->snd_cwnd,
+            sk_wmem_alloc_get(sk) < SKB_TRUESIZE(1),
+            tp->write_seq, tp->snd_nxt,
+            tp->write_seq - tp->snd_nxt,
+            tp->mss_cache
+            );
 }
 EXPORT_SYMBOL_GPL(tcp_rate_check_app_limited);

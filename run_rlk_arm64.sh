@@ -156,15 +156,28 @@ run_qemu_debian(){
 			mkdir -p $LROOT/kmodules
 		fi
 
-		cmd="$QEMU -m 1024 -cpu max,sve=on,sve256=on -M virt,gic-version=3,its=on,iommu=smmuv3,mte=on\
+        # usernet TCP rtt计算异常
+		# cmd="$QEMU -m 1024 -cpu max,sve=on,sve256=on -M virt,gic-version=3,its=on,iommu=smmuv3,mte=on\
+		# 	-nographic $SMP -kernel arch/arm64/boot/Image \
+		# 	-append \"$kernel_arg $debug_arg $rootfs_arg $crash_arg $dyn_arg\"\
+		# 	-drive if=none,file=$rootfs_image,id=hd0\
+		# 	-device virtio-blk-device,drive=hd0\
+		# 	--fsdev local,id=kmod_dev,path=./kmodules,security_model=none\
+		# 	-device virtio-9p-pci,fsdev=kmod_dev,mount_tag=kmod_mount\
+		# 	-device virtio-net-device,netdev=usernet -netdev user,id=usernet,hostfwd=tcp:127.0.0.1:5555-:22\
+		# 	$DBG"
+
+        # 使用TAP模式最接近真实网络
+        cmd="$QEMU -m 1024 -cpu max,sve=on,sve256=on -M virt,gic-version=3,its=on,iommu=smmuv3,mte=on\
 			-nographic $SMP -kernel arch/arm64/boot/Image \
 			-append \"$kernel_arg $debug_arg $rootfs_arg $crash_arg $dyn_arg\"\
 			-drive if=none,file=$rootfs_image,id=hd0\
 			-device virtio-blk-device,drive=hd0\
 			--fsdev local,id=kmod_dev,path=./kmodules,security_model=none\
 			-device virtio-9p-pci,fsdev=kmod_dev,mount_tag=kmod_mount\
-			-device virtio-net-device,netdev=usernet -netdev user,id=usernet,hostfwd=tcp:127.0.0.1:5555-:22\
+			-device virtio-net-device,netdev=tap0 -netdev tap,id=tap0,ifname=tap0,script=no,downscript=no\
 			$DBG"
+
 		echo "running:"
 		echo $cmd
 		eval $cmd

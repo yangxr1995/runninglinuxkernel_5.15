@@ -35,6 +35,7 @@
  *
  */
 
+#include "linux/kernel.h"
 #define pr_fmt(fmt) "TCP: " fmt
 
 #include <net/tcp.h>
@@ -68,7 +69,10 @@ static void tcp_event_new_data_sent(struct sock *sk, struct sk_buff *skb)
 	struct tcp_sock *tp = tcp_sk(sk);
 	unsigned int prior_packets = tp->packets_out;
 
+    u32 send_len = TCP_SKB_CB(skb)->end_seq - tp->snd_nxt;
 	WRITE_ONCE(tp->snd_nxt, TCP_SKB_CB(skb)->end_seq);
+    trace_printk("tp->snd_nxt += [%u] tp->write_seq - tp->snd_nxt = [%u]", 
+            send_len, tp->write_seq - tp->snd_nxt);
 
 	__skb_unlink(skb, &sk->sk_write_queue);
 	tcp_rbtree_insert(&sk->tcp_rtx_queue, skb);
