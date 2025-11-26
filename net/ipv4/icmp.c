@@ -57,6 +57,8 @@
  *	  This would also greatly simply some upper layer error handlers. --AK
  */
 
+#include "linux/time_namespace.h"
+#include "linux/timekeeping.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/module.h>

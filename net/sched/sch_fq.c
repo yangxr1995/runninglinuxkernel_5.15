@@ -221,8 +221,6 @@ static void fq_flow_set_throttled(struct fq_sched_data *q, struct fq_flow *f)
     // 以最小的延迟发送时间为队列的延迟发送时间
 	if (q->time_next_delayed_flow > f->time_next_packet) {
 		q->time_next_delayed_flow = f->time_next_packet;
-        trace_printk("%s:%d:q->time_next_delayed_flow:[%llx]",
-                __func__, __LINE__, q->time_next_delayed_flow);
     }
 }
 
@@ -530,9 +528,6 @@ static int fq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 	struct fq_sched_data *q = qdisc_priv(sch);
 	struct fq_flow *f;
 
-    trace_printk("%s:%d:q->time_next_delayed_flow:[%llx]",
-            __func__, __LINE__, q->time_next_delayed_flow);
-
 	if (unlikely(sch->q.qlen >= sch->limit))
 		return qdisc_drop(skb, sch, to_free);
 
@@ -644,8 +639,6 @@ static void fq_check_throttled(struct fq_sched_data *q, u64 now)
 
     // ## 3. 重置下一次检查时间
 	q->time_next_delayed_flow = ~0ULL;
-    trace_printk("%s:%d:q->time_next_delayed_flow:[%llx]",
-            __func__, __LINE__, q->time_next_delayed_flow);
 
     // ## 4. 处理节流流队列
     // - `rb_first(&q->delayed)`：获取时间最早的节流流
@@ -659,9 +652,6 @@ static void fq_check_throttled(struct fq_sched_data *q, u64 now)
         //    - 跳出循环，避免处理后续的流
 		if (f->time_next_packet > now) {
 			q->time_next_delayed_flow = f->time_next_packet;
-            trace_printk("%s:%d:q->time_next_delayed_flow:[%llx]",
-                    __func__, __LINE__, q->time_next_delayed_flow);
-
 			break;
 		}
         // 2. **流可以解除节流：**
@@ -707,8 +697,6 @@ static struct sk_buff *fq_dequeue(struct Qdisc *sch)
 	u32 plen;
 	u64 now;
 
-    trace_printk("%s:%d:q->time_next_delayed_flow:[%llx]",
-            __func__, __LINE__, q->time_next_delayed_flow);
 	if (!sch->q.qlen)
 		return NULL;
 
